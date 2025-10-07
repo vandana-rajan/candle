@@ -37,6 +37,7 @@ pub mod dinov2reg4;
 pub mod distilbert;
 pub mod efficientnet;
 pub mod efficientvit;
+pub mod embed_gemma;
 pub mod encodec;
 pub mod eva2;
 pub mod falcon;

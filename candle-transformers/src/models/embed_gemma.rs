@@ -1,4 +1,6 @@
-// Embedding Gemma inference implementation
+// Embedding Gemma inference implementation, 
+// modified from 'https://github.com/huggingface/text-embeddings-inference/blob/main/backends/candle/src/models/gemma3.rs'
+
 use crate::layers::{
     apply_rotary, get_cos_sin, get_cublas_lt_wrapper, get_inv_freqs, HiddenAct, Linear,
 };
@@ -942,15 +944,16 @@ impl Gemma3Embedder {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        let api = Api::new()?;
+        let api = Api::new().map_err(|e| candle::Error::Msg(e.to_string()))?;
         let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
 
-        let tokenizer_file = repo.get("tokenizer.json")?;
-        let config_file = repo.get("config.json")?;
-        let weights_file = repo.get("model.safetensors")?;
+        let tokenizer_file = repo.get("tokenizer.json").map_err(|e| candle::Error::Msg(e.to_string()))?;
+        let config_file = repo.get("config.json").map_err(|e| candle::Error::Msg(e.to_string()))?;
+        let weights_file = repo.get("model.safetensors").map_err(|e| candle::Error::Msg(e.to_string()))?;
 
-        let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(anyhow::Error::msg)?;
-        let config: Gemma3Config = serde_json::from_reader(std::fs::File::open(config_file)?)?;
+        let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(|e| candle::Error::Msg(e.to_string()))?;
+        let config: Gemma3Config = serde_json::from_reader(std::fs::File::open(config_file).unwrap())
+        .map_err(|e| candle::Error::Msg(e.to_string()))?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_file], dtype, device)? };
 
         let model = Gemma3Model::load(vb, &config, ModelType::Embedding(Pool::Mean))?;
@@ -963,7 +966,15 @@ impl Gemma3Embedder {
         let batch = self.encode_batch(&[text.to_string()]);
         let (pooled, _) = self.model.forward(batch)?;
         let pooled = pooled.expect("Mean pooling failed");
-        Ok(pooled.to_vec1::<f32>()?)
+        let pooled = pooled.to_vec2::<f32>()?;
+        let mut emb = pooled[0].clone();
+
+        // L2 normalization
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in emb.iter_mut() {
+            *x /= norm;
+        }
+        Ok(emb)
     }
 
     /// Embed multiple sentences at once
@@ -986,7 +997,7 @@ impl Gemma3Embedder {
         let mut max_len = 0;
 
         for text in texts {
-            let encoding = self.tokenizer.encode(text, true).unwrap();
+            let encoding = self.tokenizer.encode(text.as_str(), true).unwrap();
             let ids = encoding.get_ids().to_vec();
             let len = ids.len();
             max_len = max_len.max(len);
@@ -996,9 +1007,10 @@ impl Gemma3Embedder {
             cumulative.push(cumulative.last().unwrap() + len as u32);
         }
 
+        let token_len = all_ids.len();
         Batch {
             input_ids: all_ids,
-            token_type_ids: vec![0; all_ids.len()],
+            token_type_ids: vec![0; token_len],
             position_ids: all_positions,
             cumulative_seq_lengths: cumulative,
             max_length: max_len as u32,
